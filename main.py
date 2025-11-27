@@ -5,17 +5,13 @@ import uuid
 import httpx
 import uvicorn
 import sys
-import os
-from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import StreamingResponse
-from fastapi.middleware.cors import CORSMiddleware
 from typing import Dict, Any, Optional, List, Generator
 
 # --- Configuration ---
-PORT = int(os.environ.get("PORT", 7860))
-API_KEY = os.environ.get("API_KEY", None)  # Optional API Key for security
-HEADLESS = os.environ.get("HEADLESS", "false").lower() == "true"
-
+PORT_API = 28880
+PORT_WS = 28881
 MODELS_CONFIG_FILE = "models.json"
 STATS_FILE = "stats.json"
 
@@ -59,30 +55,12 @@ class CredentialManager:
         self.filepath = filepath
         self.latest_harvest: Optional[Dict[str, Any]] = None
         self.last_updated: float = 0
-        self._refresh_event = None
-        self._refresh_complete_event = None
-        self._refresh_lock = None
+        self.refresh_event = asyncio.Event() # Event to block requests during refresh
+        self.refresh_complete_event = asyncio.Event() # Event to signal UI is ready after refresh
+        self.refresh_lock = asyncio.Lock() # Lock to ensure only one refresh triggers at a time
+        self.refresh_event.set() # Initially set (not refreshing)
+        self.refresh_complete_event.set()
         self.load_from_disk()
-
-    @property
-    def refresh_event(self):
-        if self._refresh_event is None:
-            self._refresh_event = asyncio.Event()
-            self._refresh_event.set()
-        return self._refresh_event
-
-    @property
-    def refresh_complete_event(self):
-        if self._refresh_complete_event is None:
-            self._refresh_complete_event = asyncio.Event()
-            self._refresh_complete_event.set()
-        return self._refresh_complete_event
-
-    @property
-    def refresh_lock(self):
-        if self._refresh_lock is None:
-            self._refresh_lock = asyncio.Lock()
-        return self._refresh_lock
 
     def load_from_disk(self):
         try:
@@ -219,7 +197,7 @@ class VertexAIClient:
         # Combine reasoning and content if reasoning exists
         final_content = full_content
         if reasoning_content:
-            final_content = f"<think>\n{reasoning_content}\n</think>\n\n{full_content}"
+            final_content = f"**Reasoning:**\n{reasoning_content}\n\n**Response:**\n{full_content}"
         
         # Workaround for clients that treat empty content as failure
         if not final_content:
@@ -562,20 +540,15 @@ class VertexAIClient:
                         
                         # Check for potential token expiration
                         if response.status_code in [400, 401, 403] and attempt < max_retries:
-                            print(f"⚠️ Auth Error ({response.status_code}). Handling refresh...")
+                            print(f"⚠️ Auth Error ({response.status_code}). Triggering UI refresh and waiting...")
                             
-                            async with cred_manager.refresh_lock:
-                                # Check if credentials were just updated by another thread
-                                if time.time() - cred_manager.last_updated < 10:
-                                    print("ℹ️ Credentials recently updated. Retrying with new token...")
-                                    refreshed = True
-                                else:
-                                    print("🔄 Triggering UI refresh and waiting...")
-                                    await request_token_refresh()
-                                    refreshed = await cred_manager.wait_for_refresh(timeout=45)
+                            # Trigger UI Refresh
+                            await request_token_refresh()
                             
+                            # Wait for new credentials
+                            refreshed = await cred_manager.wait_for_refresh(timeout=45)
                             if refreshed:
-                                print("✅ Credentials ready! Waiting 1s before retrying request...")
+                                print("✅ Credentials refreshed! Waiting 1s before retrying request...")
                                 await asyncio.sleep(1) # Add 1 second delay
                                 # Update headers/url with new credentials
                                 new_creds = cred_manager.get_credentials()
@@ -663,36 +636,28 @@ class VertexAIClient:
             except AuthError as e:
                 print(f"⚠️ Auth Error caught in stream: {e}")
                 if attempt < max_retries:
-                    async with cred_manager.refresh_lock:
-                        # Check if credentials were just updated by another thread
-                        if time.time() - cred_manager.last_updated < 10:
-                            print("ℹ️ Credentials recently updated. Retrying with new token...")
-                            refreshed = True
-                            ui_ready = True
+                    print("🔄 Triggering refresh and retrying...")
+                    await request_token_refresh()
+                    # Step 1: Wait for the new credentials to be harvested
+                    refreshed = await cred_manager.wait_for_refresh(timeout=60)
+                    if refreshed:
+                        # Step 2: Wait for the frontend to confirm the UI is stable
+                        ui_ready = await cred_manager.wait_for_refresh_complete(timeout=60)
+                        if ui_ready:
+                            print("✅ Credentials and UI ready! Waiting 1s before retrying request...")
+                            await asyncio.sleep(1) # Add 1 second delay
+                            # Update headers/url with new credentials
+                            new_creds = cred_manager.get_credentials()
+                            headers = new_creds['headers'].copy()
+                            headers['content-type'] = 'application/json'
+                            headers.pop('content-length', None)
+                            headers.pop('host', None)
+                            url = new_creds['url']
+                            continue # Retry the request
                         else:
-                            print("🔄 Triggering refresh and retrying...")
-                            await request_token_refresh()
-                            # Step 1: Wait for the new credentials to be harvested
-                            refreshed = await cred_manager.wait_for_refresh(timeout=60)
-                            if refreshed:
-                                # Step 2: Wait for the frontend to confirm the UI is stable
-                                ui_ready = await cred_manager.wait_for_refresh_complete(timeout=60)
-                            else:
-                                ui_ready = False
-
-                    if refreshed and ui_ready:
-                        print("✅ Credentials and UI ready! Waiting 1s before retrying request...")
-                        await asyncio.sleep(1) # Add 1 second delay
-                        # Update headers/url with new credentials
-                        new_creds = cred_manager.get_credentials()
-                        headers = new_creds['headers'].copy()
-                        headers['content-type'] = 'application/json'
-                        headers.pop('content-length', None)
-                        headers.pop('host', None)
-                        url = new_creds['url']
-                        continue # Retry the request
+                            print("❌ Frontend UI did not become ready in time.")
                     else:
-                        print("❌ Credential refresh failed or timed out.")
+                        print("❌ Credential refresh timed out.")
 
                 error_payload = {"error": {"message": str(e), "type": "authentication_error"}}
                 yield f"data: {json.dumps(error_payload)}\n\n"
@@ -818,27 +783,8 @@ vertex_client = VertexAIClient()
 # --- FastAPI App ---
 app = FastAPI()
 
-# Enable CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-@app.get("/")
-async def root():
-    return {"status": "running", "service": "Vertex AI Proxy"}
-
 @app.get("/v1/models")
-async def list_models(request: Request):
-    # API Key Check
-    if API_KEY:
-        auth = request.headers.get("Authorization")
-        if not auth or not auth.startswith("Bearer ") or auth[7:] != API_KEY:
-            raise HTTPException(status_code=401, detail="Invalid API Key")
-
+async def list_models():
     # Return a list of common Vertex AI models
     # This helps clients know what's available
     current_time = int(time.time())
@@ -863,12 +809,6 @@ async def list_models(request: Request):
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
-    # API Key Check
-    if API_KEY:
-        auth = request.headers.get("Authorization")
-        if not auth or not auth.startswith("Bearer ") or auth[7:] != API_KEY:
-            raise HTTPException(status_code=401, detail="Invalid API Key")
-
     try:
         body = await request.json()
         messages = body.get('messages', [])
@@ -916,80 +856,17 @@ async def chat_completions(request: Request):
         # FastAPI handles exceptions better, but for compatibility:
         raise HTTPException(status_code=500, detail={"error": str(e)})
 
-# --- Admin Endpoints ---
-@app.get("/admin")
-async def admin_page(request: Request):
-    # Simple HTML form to update cookies
-    html_content = """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Vertex AI Proxy Admin</title>
-        <style>
-            body { font-family: sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; background: #1e1e1e; color: #e0e0e0; }
-            textarea { width: 100%; height: 300px; background: #252526; color: #d4d4d4; border: 1px solid #3e3e42; padding: 10px; font-family: monospace; }
-            button { background: #0e639c; color: white; border: none; padding: 10px 20px; cursor: pointer; margin-top: 10px; }
-            button:hover { background: #1177bb; }
-            .card { background: #252526; padding: 20px; border-radius: 8px; margin-bottom: 20px; }
-            h2 { margin-top: 0; }
-        </style>
-    </head>
-    <body>
-        <h1>🛠️ Admin Dashboard</h1>
-        
-        <div class="card">
-            <h2>🍪 Update Cloud Cookies</h2>
-            <p>Paste your exported Google Cookies (JSON) here to hot-reload the Cloud Harvester.</p>
-            <form action="/admin/update_cookies" method="post">
-                <textarea name="cookies" placeholder='[{"domain": ".google.com", ...}]'></textarea>
-                <br>
-                <input type="password" name="api_key" placeholder="API Key (if enabled)" style="padding: 8px; width: 200px; margin-top: 10px; background: #3e3e42; color: white; border: 1px solid #555;">
-                <button type="submit">Update Cookies</button>
-            </form>
-        </div>
-    </body>
-    </html>
-    """
-    return StreamingResponse(iter([html_content]), media_type="text/html")
-
-@app.post("/admin/update_cookies")
-async def update_cookies(request: Request):
-    form = await request.form()
-    cookies = form.get("cookies")
-    api_key = form.get("api_key")
-    
-    # Security Check
-    if API_KEY and api_key != API_KEY:
-        return StreamingResponse(iter(["<h1>❌ Invalid API Key</h1>"]), media_type="text/html", status_code=401)
-        
-    if not cookies:
-        return StreamingResponse(iter(["<h1>❌ No cookies provided</h1>"]), media_type="text/html", status_code=400)
-    
-    # Validate JSON
-    try:
-        json.loads(cookies)
-    except json.JSONDecodeError:
-        return StreamingResponse(iter(["<h1>❌ Invalid JSON format</h1>"]), media_type="text/html", status_code=400)
-        
-    # Update Harvester
-    if 'harvester' in globals() and harvester:
-        await harvester.update_cookies(cookies)
-        return StreamingResponse(iter(["<h1>✅ Cookies Updated! Harvester restarting...</h1><a href='/admin'>Back</a>"]), media_type="text/html")
-    else:
-        return StreamingResponse(iter(["<h1>⚠️ Cloud Harvester is not running. (Did you set GOOGLE_COOKIES env var?)</h1>"]), media_type="text/html")
-
 # --- WebSocket Server (For Harvester) ---
-# Store connected harvester clients
-harvester_clients: set[WebSocket] = set()
+import websockets
 
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    await websocket.accept()
+# Store connected harvester clients
+harvester_clients = set()
+
+async def websocket_handler(websocket):
     print("🔌 WebSocket client connected")
     harvester_clients.add(websocket)
     try:
-        while True:
-            message = await websocket.receive_text()
+        async for message in websocket:
             try:
                 data = json.loads(message)
                 msg_type = data.get("type")
@@ -1004,7 +881,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     print(f"👋 Client identified: {data.get('client')}")
             except Exception as e:
                 print(f"WS Error: {e}")
-    except WebSocketDisconnect:
+    except websockets.ConnectionClosed:
         print("🔌 WebSocket client disconnected")
         harvester_clients.remove(websocket)
     except Exception as e:
@@ -1013,109 +890,39 @@ async def websocket_endpoint(websocket: WebSocket):
             harvester_clients.remove(websocket)
 
 async def request_token_refresh():
-    print("🔄 Requesting token refresh...")
-    
-    # 1. Trigger Cloud Harvester (if running)
-    if 'harvester' in globals() and harvester and harvester.is_running:
-        print("☁️ Triggering Cloud Harvester...")
-        # We don't await this because perform_harvest might take time,
-        # and we want to trigger WS clients too.
-        # But wait, perform_harvest is async. We should probably fire and forget or await?
-        # Since we are inside a request handler (stream_chat), awaiting might block.
-        # But we need the result.
-        # Actually, CloudHarvester loop runs periodically. We can force an immediate run.
-        # Let's add a method to CloudHarvester to force harvest.
-        asyncio.create_task(harvester.perform_harvest())
-        return # If we have a cloud harvester, we might not need WS clients, or maybe both?
-               # Let's try both just in case.
-
-    # 2. Trigger WebSocket Clients (Local Browser)
+    print("🔄 Requesting token refresh from frontend...")
     if not harvester_clients:
         print("⚠️ No harvester clients connected!")
         return
     
-    print("🔌 Requesting refresh from WebSocket clients...")
     message = json.dumps({"type": "refresh_token"})
     # Broadcast to all connected harvesters
     for ws in list(harvester_clients):
         try:
-            await ws.send_text(message)
+            await ws.send(message)
         except Exception as e:
             print(f"Failed to send refresh request: {e}")
-            # WebSocketDisconnect is handled in the endpoint loop usually,
-            # but if send fails we might want to remove it.
-            if ws in harvester_clients:
-                harvester_clients.remove(ws)
-
-async def keep_alive_loop():
-    """Background task to refresh credentials periodically (every 45 mins)."""
-    print("⏰ Keep-Alive Task Started")
-    while True:
-        try:
-            # Wait for 45 minutes (2700 seconds)
-            # We check every minute to see if we need to exit or if we should trigger early
-            for _ in range(45):
-                await asyncio.sleep(60)
-            
-            print("⏰ Keep-Alive: Triggering scheduled refresh...")
-            await request_token_refresh()
-            
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            print(f"⚠️ Keep-Alive Error: {e}")
-            await asyncio.sleep(60)
+            harvester_clients.remove(ws)
 
 async def main():
-    config = uvicorn.Config(app, host="0.0.0.0", port=PORT, log_level="info")
+    # Start WebSocket Server
+    ws_server = websockets.serve(websocket_handler, "0.0.0.0", PORT_WS)
+    
+    # Start API Server
+    config = uvicorn.Config(app, host="0.0.0.0", port=PORT_API, log_level="info")
     server = uvicorn.Server(config)
 
     print(f"\n🚀 Headful Proxy Started")
-    print(f"   - Address: http://0.0.0.0:{PORT}")
-    print(f"   - WebSocket: ws://0.0.0.0:{PORT}/ws")
-    if API_KEY:
-        print(f"   - Security: API Key enabled")
-    
-    # --- Cloud Harvester Integration ---
-    # Check if we should run the cloud harvester (requires GOOGLE_COOKIES)
-    # Make harvester global so admin endpoint can access it
-    global harvester
-    harvester = None
-    
-    # Check if we should run the cloud harvester
-    # 1. Explicitly enabled via ENABLE_AUTO_HARVEST
-    # 2. Implicitly enabled if GOOGLE_COOKIES is set
-    enable_cloud = os.environ.get("ENABLE_AUTO_HARVEST", "false").lower() == "true"
-    if os.environ.get("GOOGLE_COOKIES"):
-        enable_cloud = True
+    print(f"   - API: http://0.0.0.0:{PORT_API} (Accessible via LAN IP)")
+    print(f"   - WS:  ws://0.0.0.0:{PORT_WS}")
+    print("   👉 Please ensure the 'Harvester' userscript is running in your browser.")
 
-    if enable_cloud:
-        try:
-            from cloud_harvester import CloudHarvester
-            harvester = CloudHarvester(cred_manager)
-            # Run harvester in background
-            asyncio.create_task(harvester.start())
-            print("☁️ Cloud Harvester initialized (Experimental).")
-        except ImportError:
-            print("⚠️ Cloud Harvester dependencies (playwright) not found.")
-    else:
-        print("   👉 Please ensure the 'Harvester' userscript is running in your browser.")
-
-    # Start Keep-Alive Loop to proactively refresh tokens
-    asyncio.create_task(keep_alive_loop())
-
-    await server.serve()
+    await asyncio.gather(ws_server, server.serve())
 
 if __name__ == "__main__":
-    if HEADLESS:
-        print("🖥️ Running in HEADLESS mode")
+    import gui
+    
+    def server_runner():
         asyncio.run(main())
-    else:
-        try:
-            import gui
-            def server_runner():
-                asyncio.run(main())
-            gui.run(server_runner, stats_manager)
-        except ImportError:
-            print("⚠️ GUI dependencies not found or failed. Falling back to headless mode.")
-            asyncio.run(main())
+        
+    gui.run(server_runner, stats_manager)
